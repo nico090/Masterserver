@@ -1,0 +1,10 @@
+services:
+  master-server:
+    build: .
+    container_name: bossroom-master-server
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ../linuxserver:/linuxserver
+    env_file:
+      - .env
