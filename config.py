@@ -15,6 +15,10 @@ MASTER_SERVER_INTERNAL_URL = os.getenv("MASTER_SERVER_INTERNAL_URL", "http://127
 SERVER_SECRET = os.getenv("SERVER_SECRET", "change-me-in-production")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "change-me")
 
+# URL of host_agent.py running on the host machine.
+# Since docker-compose uses network_mode: host, 127.0.0.1 reaches the host directly.
+HOST_AGENT_URL = os.getenv("HOST_AGENT_URL", "http://127.0.0.1:8099")
+
 # Timeouts (seconds)
 HEARTBEAT_TIMEOUT_SECONDS = 45
 EMPTY_ROOM_TIMEOUT_SECONDS = 120
