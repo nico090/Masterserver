@@ -23,7 +23,7 @@ HOST_AGENT_URL = os.getenv("HOST_AGENT_URL", "http://127.0.0.1:8099")
 HEARTBEAT_TIMEOUT_SECONDS = 45
 EMPTY_ROOM_TIMEOUT_SECONDS = 120
 STARTING_TIMEOUT_SECONDS = 60
-PENDING_KEY_TIMEOUT_SECONDS = 30  # keys expire after 30s if not consumed
+PENDING_KEY_TIMEOUT_SECONDS = 90  # keys expire after 90s — creator gets key at room creation but server needs ~5-8s to start
 
 # Rate limiting
 MAX_ROOMS_PER_MINUTE = int(os.getenv("MAX_ROOMS_PER_MINUTE", "5"))

@@ -193,6 +193,14 @@ async def join_room(body: JoinRequest):
     )
 
 
+@app.get("/api/rooms/{room_id}/status")
+async def room_status(room_id: str):
+    room = room_mgr.get_room(room_id)
+    if room is None:
+        raise HTTPException(404, "Room not found")
+    return {"room_id": room_id, "status": room.status, "current_players": room.current_players}
+
+
 @app.delete("/api/rooms/{room_id}")
 async def delete_room(room_id: str, x_admin_key: str = Header()):
     if x_admin_key != config.ADMIN_API_KEY:
