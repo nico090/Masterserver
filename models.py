@@ -10,22 +10,17 @@ class RoomStatus(str, Enum):
     CLOSING = "closing"
 
 
-class RoomCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=64)
-    password: str | None = None
-    max_players: int = Field(default=8, ge=2, le=16)
-    creator_name: str | None = None  # Name of the player creating the room
-
-
 class RoomInfo(BaseModel):
     room_id: str
     name: str
     has_password: bool
+    is_locked: bool
     current_players: int
     max_players: int
     host_address: str
     port: int
     status: RoomStatus
+    admin_player: str | None = None
     created_at: str  # ISO 8601 string for JSON compatibility
 
 
@@ -40,16 +35,19 @@ class JoinResponse(BaseModel):
     host_address: str | None = None
     port: int | None = None
     room_key: str | None = None
+    is_admin: bool = False
     error: str | None = None
 
 
-class CreateRoomResponse(BaseModel):
+class SetPrivateRequest(BaseModel):
     room_id: str
-    name: str
-    port: int
-    max_players: int
-    host_address: str
-    room_key: str  # For the creator to join immediately
+    player_name: str  # must match admin
+    password: str | None = None  # password to set (None to remove / unlock)
+
+
+class StartGameRequest(BaseModel):
+    room_id: str
+    player_name: str  # must match admin
 
 
 class HeartbeatRequest(BaseModel):

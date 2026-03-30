@@ -30,7 +30,8 @@ async def init_db():
                 status       TEXT NOT NULL,
                 current_players INTEGER NOT NULL DEFAULT 0,
                 created_at   TEXT NOT NULL,
-                last_heartbeat TEXT NOT NULL
+                last_heartbeat TEXT NOT NULL,
+                admin_player TEXT
             )
         """)
         await db.commit()
@@ -39,19 +40,21 @@ async def init_db():
 
 async def db_upsert_room(room_id: str, name: str, port: int, max_players: int,
                          status: str, current_players: int,
-                         created_at: datetime, last_heartbeat: datetime):
+                         created_at: datetime, last_heartbeat: datetime,
+                         admin_player: str | None = None):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             INSERT INTO rooms
-                (room_id, name, port, max_players, status, current_players, created_at, last_heartbeat)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (room_id, name, port, max_players, status, current_players, created_at, last_heartbeat, admin_player)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(room_id) DO UPDATE SET
                 status          = excluded.status,
                 current_players = excluded.current_players,
-                last_heartbeat  = excluded.last_heartbeat
+                last_heartbeat  = excluded.last_heartbeat,
+                admin_player    = excluded.admin_player
         """, (
             room_id, name, port, max_players, status, current_players,
-            created_at.isoformat(), last_heartbeat.isoformat(),
+            created_at.isoformat(), last_heartbeat.isoformat(), admin_player,
         ))
         await db.commit()
 

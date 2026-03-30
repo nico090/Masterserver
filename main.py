@@ -1,22 +1,20 @@
 import asyncio
 import logging
-import time
-from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header
 
 import config
 from database import db_clear_all_rooms, db_delete_room, db_load_rooms, db_upsert_room, init_db
 from models import (
-    CreateRoomResponse,
     HeartbeatRequest,
     JoinRequest,
     JoinResponse,
-    RoomCreate,
     RoomInfo,
     ServerStats,
+    SetPrivateRequest,
+    StartGameRequest,
     ValidateKeyRequest,
     ValidateKeyResponse,
 )
@@ -32,8 +30,32 @@ logger = logging.getLogger("master_server")
 room_mgr = RoomManager()
 proc_mgr = ProcessManager()
 
-# Simple in-memory rate limiter: ip -> list of timestamps
-_create_timestamps: dict[str, list[float]] = defaultdict(list)
+
+# ---------------------------------------------------------------------------
+# Pre-create rooms on startup
+# ---------------------------------------------------------------------------
+
+async def _precreate_rooms():
+    """Create the fixed set of rooms and spawn their game servers."""
+    for i in range(config.NUM_ROOMS):
+        name = config.DEFAULT_ROOM_NAMES[i] if i < len(config.DEFAULT_ROOM_NAMES) else f"Sala {i + 1}"
+        room = room_mgr.create_room(name, config.DEFAULT_MAX_PLAYERS)
+        if room is None:
+            logger.error(f"Could not allocate port for room #{i + 1}")
+            continue
+
+        ok = proc_mgr.spawn_server(room.room_id, room.port, room.max_players)
+        if not ok:
+            logger.error(f"Failed to start game server for room '{name}'")
+            room_mgr.remove_room(room.room_id)
+            continue
+
+        await db_upsert_room(
+            room.room_id, room.name, room.port, room.max_players,
+            room.status, room.current_players, room.created_at, room.last_heartbeat,
+            room.admin_player,
+        )
+        logger.info(f"Pre-created room '{name}' ({room.room_id}) on port {room.port}")
 
 
 # ---------------------------------------------------------------------------
@@ -45,37 +67,77 @@ async def cleanup_loop():
         await asyncio.sleep(30)
         now = datetime.now(timezone.utc)
 
-        # 1. Remove rooms whose process died
+        # 1. Remove rooms whose process died — respawn them
         dead = proc_mgr.cleanup_dead()
         for room_id in dead:
-            logger.warning(f"Server process died for room {room_id}")
+            logger.warning(f"Server process died for room {room_id}, removing and respawning")
+            old_room = room_mgr.get_room(room_id)
+            old_name = old_room.name if old_room else "Sala"
             room_mgr.remove_room(room_id)
             await db_delete_room(room_id)
+
+            # Respawn a replacement room
+            new_room = room_mgr.create_room(old_name, config.DEFAULT_MAX_PLAYERS)
+            if new_room:
+                ok = proc_mgr.spawn_server(new_room.room_id, new_room.port, new_room.max_players)
+                if ok:
+                    await db_upsert_room(
+                        new_room.room_id, new_room.name, new_room.port, new_room.max_players,
+                        new_room.status, new_room.current_players, new_room.created_at,
+                        new_room.last_heartbeat, new_room.admin_player,
+                    )
+                    logger.info(f"Respawned room '{old_name}' as {new_room.room_id}")
+                else:
+                    room_mgr.remove_room(new_room.room_id)
 
         # 2. Check heartbeat timeouts and stale rooms
         for room in room_mgr.all_rooms():
             elapsed = (now - room.last_heartbeat).total_seconds()
 
             if room.status == "starting" and elapsed > config.STARTING_TIMEOUT_SECONDS:
-                logger.warning(f"Room {room.room_id} stuck in starting, killing")
+                logger.warning(f"Room {room.room_id} stuck in starting, killing and respawning")
+                old_name = room.name
                 proc_mgr.kill_server(room.room_id)
                 room_mgr.remove_room(room.room_id)
                 await db_delete_room(room.room_id)
+                # Respawn
+                new_room = room_mgr.create_room(old_name, config.DEFAULT_MAX_PLAYERS)
+                if new_room:
+                    ok = proc_mgr.spawn_server(new_room.room_id, new_room.port, new_room.max_players)
+                    if ok:
+                        await db_upsert_room(
+                            new_room.room_id, new_room.name, new_room.port, new_room.max_players,
+                            new_room.status, new_room.current_players, new_room.created_at,
+                            new_room.last_heartbeat, new_room.admin_player,
+                        )
+                    else:
+                        room_mgr.remove_room(new_room.room_id)
 
             elif room.status == "ready" and room.current_players == 0 and elapsed > config.EMPTY_ROOM_TIMEOUT_SECONDS:
-                logger.info(f"Room {room.room_id} empty too long, killing")
-                proc_mgr.kill_server(room.room_id)
-                room_mgr.remove_room(room.room_id)
-                await db_delete_room(room.room_id)
+                # Room is empty for too long — reset it (clear admin, password) instead of killing
+                logger.info(f"Room {room.room_id} empty too long, resetting state")
+                room.reset()
 
             elif elapsed > config.HEARTBEAT_TIMEOUT_SECONDS and room.status != "starting":
-                logger.warning(f"Room {room.room_id} heartbeat timeout ({elapsed:.0f}s)")
+                logger.warning(f"Room {room.room_id} heartbeat timeout ({elapsed:.0f}s), killing and respawning")
+                old_name = room.name
                 proc_mgr.kill_server(room.room_id)
                 room_mgr.remove_room(room.room_id)
                 await db_delete_room(room.room_id)
+                # Respawn
+                new_room = room_mgr.create_room(old_name, config.DEFAULT_MAX_PLAYERS)
+                if new_room:
+                    ok = proc_mgr.spawn_server(new_room.room_id, new_room.port, new_room.max_players)
+                    if ok:
+                        await db_upsert_room(
+                            new_room.room_id, new_room.name, new_room.port, new_room.max_players,
+                            new_room.status, new_room.current_players, new_room.created_at,
+                            new_room.last_heartbeat, new_room.admin_player,
+                        )
+                    else:
+                        room_mgr.remove_room(new_room.room_id)
 
             else:
-                # Purge expired pending keys while we're at it
                 room.purge_expired_keys()
 
 
@@ -84,7 +146,6 @@ async def lifespan(app: FastAPI):
     await init_db()
 
     # Restore rooms that were alive before a restart.
-    # If the process is gone (crashed master server), prune the stale entry.
     for row in await db_load_rooms():
         if not proc_mgr.is_alive(row["room_id"]):
             logger.info(f"Pruning stale room {row['room_id']} from DB (no live process)")
@@ -92,8 +153,32 @@ async def lifespan(app: FastAPI):
         else:
             logger.info(f"Restored room {row['room_id']} from DB")
 
+    # Ensure we always have NUM_ROOMS rooms running
+    current_count = len(room_mgr.all_rooms())
+    rooms_to_create = config.NUM_ROOMS - current_count
+    if rooms_to_create > 0:
+        logger.info(f"Need to create {rooms_to_create} rooms (have {current_count}/{config.NUM_ROOMS})")
+        for i in range(rooms_to_create):
+            idx = current_count + i
+            name = config.DEFAULT_ROOM_NAMES[idx] if idx < len(config.DEFAULT_ROOM_NAMES) else f"Sala {idx + 1}"
+            room = room_mgr.create_room(name, config.DEFAULT_MAX_PLAYERS)
+            if room is None:
+                logger.error(f"Could not allocate port for room #{idx + 1}")
+                continue
+            ok = proc_mgr.spawn_server(room.room_id, room.port, room.max_players)
+            if not ok:
+                logger.error(f"Failed to start game server for room '{name}'")
+                room_mgr.remove_room(room.room_id)
+                continue
+            await db_upsert_room(
+                room.room_id, room.name, room.port, room.max_players,
+                room.status, room.current_players, room.created_at, room.last_heartbeat,
+                room.admin_player,
+            )
+            logger.info(f"Pre-created room '{name}' ({room.room_id}) on port {room.port}")
+
     task = asyncio.create_task(cleanup_loop())
-    logger.info(f"Master server starting — ports {config.PORT_RANGE_START}-{config.PORT_RANGE_END}")
+    logger.info(f"Master server starting — {config.NUM_ROOMS} rooms, ports {config.PORT_RANGE_START}-{config.PORT_RANGE_END}")
     yield
     task.cancel()
     proc_mgr.kill_all()
@@ -108,18 +193,6 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="BossRoom Master Server", lifespan=lifespan)
 
 
-def _check_rate_limit(client_ip: str):
-    """Raise 429 if client has created too many rooms recently."""
-    now = time.monotonic()
-    window = 60.0
-    timestamps = _create_timestamps[client_ip]
-    # Prune old entries
-    _create_timestamps[client_ip] = [t for t in timestamps if now - t < window]
-    if len(_create_timestamps[client_ip]) >= config.MAX_ROOMS_PER_MINUTE:
-        raise HTTPException(429, "Too many rooms created, try again later")
-    _create_timestamps[client_ip].append(now)
-
-
 # ---------------------------------------------------------------------------
 # Client-facing endpoints
 # ---------------------------------------------------------------------------
@@ -132,39 +205,6 @@ async def health():
 @app.get("/api/rooms", response_model=list[RoomInfo])
 async def list_rooms():
     return room_mgr.list_rooms()
-
-
-@app.post("/api/rooms", response_model=CreateRoomResponse)
-async def create_room(body: RoomCreate, request: Request):
-    _check_rate_limit(request.client.host)
-
-    room = room_mgr.create_room(body.name, body.password, body.max_players)
-    if room is None:
-        raise HTTPException(503, "No available ports — server is full")
-
-    ok = proc_mgr.spawn_server(room.room_id, room.port, room.max_players)
-    if not ok:
-        room_mgr.remove_room(room.room_id)
-        raise HTTPException(500, "Failed to start game server")
-
-    await db_upsert_room(
-        room.room_id, room.name, room.port, room.max_players,
-        room.status, room.current_players, room.created_at, room.last_heartbeat,
-    )
-
-    # Generate a room key for the creator to join immediately
-    creator_name = body.creator_name or "Creator"
-    room_key = room.generate_key(creator_name)
-
-    logger.info(f"Room created: {room.room_id} '{room.name}' on port {room.port}")
-    return CreateRoomResponse(
-        room_id=room.room_id,
-        name=room.name,
-        port=room.port,
-        max_players=room.max_players,
-        host_address=config.VPS_PUBLIC_IP,
-        room_key=room_key,
-    )
 
 
 @app.post("/api/rooms/join", response_model=JoinResponse)
@@ -182,15 +222,57 @@ async def join_room(body: JoinRequest):
     if not room.check_password(body.password):
         return JoinResponse(success=False, error="Wrong password")
 
+    # First player to join becomes admin (player 0)
+    is_admin = False
+    if room.admin_player is None:
+        room.admin_player = body.player_name
+        is_admin = True
+        logger.info(f"Player '{body.player_name}' is now admin of room {room.room_id}")
+
     room_key = room.generate_key(body.player_name)
-    logger.info(f"Player '{body.player_name}' joining room {room.room_id}")
+    logger.info(f"Player '{body.player_name}' joining room {room.room_id} (admin={is_admin})")
 
     return JoinResponse(
         success=True,
         host_address=config.VPS_PUBLIC_IP,
         port=room.port,
         room_key=room_key,
+        is_admin=is_admin,
     )
+
+
+@app.post("/api/rooms/{room_id}/set-private")
+async def set_room_private(room_id: str, body: SetPrivateRequest):
+    room = room_mgr.get_room(room_id)
+    if room is None:
+        raise HTTPException(404, "Room not found")
+
+    if room.admin_player != body.player_name:
+        raise HTTPException(403, "Only the room admin can change privacy")
+
+    room.set_password(body.password)
+    logger.info(f"Room {room_id} set to {'private' if room.is_locked else 'public'} by {body.player_name}")
+    return {"success": True, "is_locked": room.is_locked}
+
+
+@app.post("/api/rooms/{room_id}/start")
+async def start_game(room_id: str, body: StartGameRequest):
+    room = room_mgr.get_room(room_id)
+    if room is None:
+        raise HTTPException(404, "Room not found")
+
+    if room.admin_player != body.player_name:
+        raise HTTPException(403, "Only the room admin can start the game")
+
+    if room.status != "ready":
+        raise HTTPException(400, f"Room is not ready (current status: {room.status})")
+
+    if room.current_players < 1:
+        raise HTTPException(400, "Need at least 1 player to start")
+
+    room.status = "in_game"
+    logger.info(f"Game started in room {room_id} by admin {body.player_name}")
+    return {"success": True, "status": "in_game"}
 
 
 @app.get("/api/rooms/{room_id}/status")
@@ -198,7 +280,13 @@ async def room_status(room_id: str):
     room = room_mgr.get_room(room_id)
     if room is None:
         raise HTTPException(404, "Room not found")
-    return {"room_id": room_id, "status": room.status, "current_players": room.current_players}
+    return {
+        "room_id": room_id,
+        "status": room.status,
+        "current_players": room.current_players,
+        "admin_player": room.admin_player,
+        "is_locked": room.is_locked,
+    }
 
 
 @app.delete("/api/rooms/{room_id}")
@@ -236,9 +324,16 @@ async def heartbeat(body: HeartbeatRequest):
     room.current_players = body.current_players
     room.status = body.status
     room.last_heartbeat = datetime.now(timezone.utc)
+
+    # If room goes empty during gameplay, reset admin so next joiner becomes admin
+    if room.current_players == 0 and room.admin_player is not None:
+        logger.info(f"Room {room.room_id} is now empty, resetting admin")
+        room.reset()
+
     await db_upsert_room(
         room.room_id, room.name, room.port, room.max_players,
         room.status, room.current_players, room.created_at, room.last_heartbeat,
+        room.admin_player,
     )
     return {"ok": True}
 

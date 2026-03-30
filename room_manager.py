@@ -20,15 +20,13 @@ class Room:
     __slots__ = (
         "room_id", "name", "password_hash", "max_players",
         "current_players", "port", "status", "created_at",
-        "last_heartbeat", "pending_keys",
+        "last_heartbeat", "pending_keys", "admin_player", "is_locked",
     )
 
-    def __init__(self, name: str, password: str | None, max_players: int, port: int):
+    def __init__(self, name: str, max_players: int, port: int):
         self.room_id: str = uuid.uuid4().hex[:12]
         self.name = name
-        self.password_hash: bytes | None = (
-            bcrypt.hashpw(password.encode(), bcrypt.gensalt()) if password else None
-        )
+        self.password_hash: bytes | None = None
         self.max_players = max_players
         self.current_players = 0
         self.port = port
@@ -37,6 +35,8 @@ class Room:
         self.created_at = now
         self.last_heartbeat = now
         self.pending_keys: dict[str, PendingKey] = {}
+        self.admin_player: str | None = None  # name of the first player (admin / player 0)
+        self.is_locked: bool = False  # True when admin makes the room private
 
     @property
     def has_password(self) -> bool:
@@ -49,6 +49,14 @@ class Room:
             return False
         return bcrypt.checkpw(password.encode(), self.password_hash)
 
+    def set_password(self, password: str | None):
+        if password:
+            self.password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
+            self.is_locked = True
+        else:
+            self.password_hash = None
+            self.is_locked = False
+
     def generate_key(self, player_name: str) -> str:
         self.purge_expired_keys()
         key = secrets.token_urlsafe(32)
@@ -60,7 +68,6 @@ class Room:
         pk = self.pending_keys.pop(key, None)
         if pk is None:
             return None
-        # Reject expired keys
         elapsed = (datetime.now(timezone.utc) - pk.created_at).total_seconds()
         if elapsed > config.PENDING_KEY_TIMEOUT_SECONDS:
             return None
@@ -75,16 +82,27 @@ class Room:
         for k in expired:
             del self.pending_keys[k]
 
+    def reset(self):
+        """Reset room to waiting state (called when game ends or room empties)."""
+        self.admin_player = None
+        self.is_locked = False
+        self.password_hash = None
+        self.current_players = 0
+        self.pending_keys.clear()
+        # status will be updated by heartbeat from game server
+
     def to_info(self) -> dict:
         return {
             "room_id": self.room_id,
             "name": self.name,
             "has_password": self.has_password,
+            "is_locked": self.is_locked,
             "current_players": self.current_players,
             "max_players": self.max_players,
             "host_address": config.VPS_PUBLIC_IP,
             "port": self.port,
             "status": self.status,
+            "admin_player": self.admin_player,
             "created_at": self.created_at.isoformat(),
         }
 
@@ -110,12 +128,13 @@ class RoomManager:
         total = config.PORT_RANGE_END - config.PORT_RANGE_START + 1
         return total - len(self._used_ports)
 
-    def create_room(self, name: str, password: str | None, max_players: int) -> Room | None:
+    def create_room(self, name: str, max_players: int) -> Room | None:
+        """Create a room (used at startup to pre-create rooms)."""
         with self._lock:
             port = self._allocate_port()
             if port is None:
                 return None
-            room = Room(name, password, max_players, port)
+            room = Room(name, max_players, port)
             self._rooms[room.room_id] = room
             return room
 

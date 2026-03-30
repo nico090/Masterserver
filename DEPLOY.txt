@@ -1,0 +1,127 @@
+====================================================
+  DEPLOY - Master Server (con screen)
+====================================================
+
+REQUISITOS
+----------
+- Python 3.10+
+- screen  (apt install screen)
+- El binario del game server (Linux headless)
+
+----------------------------------------------------
+1. SUBIR ARCHIVOS AL VPS
+----------------------------------------------------
+
+Subir la carpeta Masterserver/ y el binario del game server.
+Ejemplo con scp:
+
+  scp -r Masterserver/ usuario@tu-vps:/opt/masterserver/
+  scp builds/ServerLinux/aaa.x86_64 usuario@tu-vps:/opt/gameserver/
+
+Darle permisos de ejecucion al binario:
+
+  chmod +x /opt/gameserver/aaa.x86_64
+
+----------------------------------------------------
+2. INSTALAR DEPENDENCIAS
+----------------------------------------------------
+
+  cd /opt/masterserver
+  python3 -m venv venv
+  source venv/bin/activate
+  pip install -r requirements.txt
+
+----------------------------------------------------
+3. CONFIGURAR .env
+----------------------------------------------------
+
+  cp .env.example .env
+  nano .env
+
+Editar como minimo:
+
+  VPS_PUBLIC_IP=tu.ip.publica
+  GAME_SERVER_PATH=/opt/gameserver/aaa.x86_64
+  GAME_SERVER_DIR=/opt/gameserver
+  SERVER_SECRET=un-secreto-largo-y-seguro
+  ADMIN_API_KEY=otra-clave-segura
+
+----------------------------------------------------
+4. LANZAR CON SCREEN
+----------------------------------------------------
+
+Crear una screen session para el master server:
+
+  screen -S masterserver
+
+Dentro de la session:
+
+  cd /opt/masterserver
+  source venv/bin/activate
+  python main.py
+
+Desattachear con:  Ctrl+A, luego D
+
+----------------------------------------------------
+5. COMANDOS UTILES DE SCREEN
+----------------------------------------------------
+
+Ver sessions activas:
+  screen -ls
+
+Reconectarse al master server:
+  screen -r masterserver
+
+Reconectarse a un game server especifico:
+  screen -r gameserver_<room_id>
+
+Matar una session:
+  screen -S masterserver -X quit
+
+----------------------------------------------------
+6. VERIFICAR QUE FUNCIONA
+----------------------------------------------------
+
+Desde el VPS:
+  curl http://127.0.0.1:8000/api/health
+
+Desde afuera:
+  curl http://tu.ip.publica:8000/api/rooms
+
+----------------------------------------------------
+7. ABRIR PUERTOS EN EL FIREWALL
+----------------------------------------------------
+
+  ufw allow 8000/tcp          # Master Server API
+  ufw allow 7770:7870/tcp     # Game Servers
+  ufw allow 7770:7870/udp     # Game Servers
+
+O con iptables:
+  iptables -A INPUT -p tcp --dport 8000 -j ACCEPT
+  iptables -A INPUT -p tcp --dport 7770:7870 -j ACCEPT
+  iptables -A INPUT -p udp --dport 7770:7870 -j ACCEPT
+
+----------------------------------------------------
+8. LOGS
+----------------------------------------------------
+
+Los logs de cada game server se guardan en:
+  /opt/masterserver/logs/<room_id>.log
+
+El master server imprime logs en stdout (visible
+dentro de la screen session).
+
+----------------------------------------------------
+9. REINICIAR / ACTUALIZAR
+----------------------------------------------------
+
+  screen -r masterserver
+  Ctrl+C                       # parar el server
+  git pull                     # o subir archivos nuevos
+  python main.py               # relanzar
+  Ctrl+A, D                    # desattachear
+
+Al reiniciar el master server, las rooms activas
+se limpian automaticamente. Los game servers
+huerfanos se mueren solos al no poder enviar
+heartbeats.

@@ -1,96 +1,85 @@
-import json
 import logging
 import os
-import urllib.error
-import urllib.request
+import shlex
+import subprocess
 
 import config
 
 logger = logging.getLogger("master_server")
 
+SCREEN_PREFIX = "gameserver_"
+
+
+def _screen_name(room_id: str) -> str:
+    return f"{SCREEN_PREFIX}{room_id}"
+
 
 class ProcessManager:
-    """
-    Delegates game-server lifecycle to host_agent.py running on the host.
-    Communicates via HTTP so that processes spawn outside the Docker container.
-    """
+    """Manages game-server lifecycle using screen sessions."""
 
     def __init__(self):
-        self._agent_url = config.HOST_AGENT_URL
-        # Tracks room_ids this instance has spawned (lost on master restart, but
-        # heartbeat timeouts handle cleanup of any restored rooms in that case).
         self._known_rooms: set[str] = set()
 
-    # ------------------------------------------------------------------
-    # Internal HTTP helpers (no external dependencies)
-    # ------------------------------------------------------------------
-
-    def _post(self, path: str, data: dict | None = None) -> dict:
-        url = f"{self._agent_url}{path}"
-        body = json.dumps(data).encode() if data else b""
-        req = urllib.request.Request(
-            url, data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                return json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            payload = {}
-            try:
-                payload = json.loads(e.read())
-            except Exception:
-                pass
-            return {"ok": False, "error": payload.get("error", str(e))}
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
-
-    def _get(self, path: str) -> dict:
-        url = f"{self._agent_url}{path}"
-        try:
-            with urllib.request.urlopen(url, timeout=5) as resp:
-                return json.loads(resp.read())
-        except Exception as e:
-            logger.warning(f"Host agent unreachable at {path}: {e}")
-            return {}
-
-    # ------------------------------------------------------------------
-    # Public API (same interface as before)
-    # ------------------------------------------------------------------
-
     def spawn_server(self, room_id: str, port: int, max_players: int) -> bool:
-        payload = {
-            "room_id": room_id,
-            "port": port,
-            "max_players": max_players,
-            "server_path": os.path.abspath(config.GAME_SERVER_PATH),
-            "server_dir": config.GAME_SERVER_DIR or "",
-            "logs_dir": os.path.abspath(config.LOG_DIR),
-            "env_vars": {
-                "GAME_SERVER_SECRET": config.SERVER_SECRET,
-                "MASTER_SERVER_URL": config.MASTER_SERVER_INTERNAL_URL,
-            },
-        }
-        result = self._post("/spawn", payload)
-        if result.get("ok"):
+        server_path = os.path.abspath(config.GAME_SERVER_PATH)
+        if not os.path.isfile(server_path):
+            logger.error(f"Binary not found: {server_path}")
+            return False
+
+        logs_dir = os.path.abspath(config.LOG_DIR)
+        os.makedirs(logs_dir, exist_ok=True)
+        log_file = os.path.join(logs_dir, f"{room_id}.log")
+        sname = _screen_name(room_id)
+
+        game_args = [
+            server_path,
+            "-batchmode", "-nographics",
+            "--server",
+            "--port", str(port),
+            "--room-id", room_id,
+            "--max-players", str(max_players),
+            "--server-secret", config.SERVER_SECRET,
+            "--master-server-url", config.MASTER_SERVER_INTERNAL_URL,
+        ]
+
+        bash_cmd = f"{shlex.join(game_args)} >> {shlex.quote(log_file)} 2>&1"
+        cwd = config.GAME_SERVER_DIR or os.path.dirname(server_path) or None
+
+        env = os.environ.copy()
+        env["GAME_SERVER_SECRET"] = config.SERVER_SECRET
+        env["MASTER_SERVER_URL"] = config.MASTER_SERVER_INTERNAL_URL
+
+        try:
+            subprocess.run(
+                ["screen", "-dmS", sname, "bash", "-c", bash_cmd],
+                cwd=cwd, env=env, check=True,
+            )
             self._known_rooms.add(room_id)
-            logger.info(f"Spawned server for room {room_id} on port {port} (screen on host)")
+            logger.info(f"Spawned server for room {room_id} on port {port}")
             return True
-        logger.error(f"Failed to spawn server for room {room_id}: {result.get('error')}")
-        return False
+        except FileNotFoundError:
+            logger.error("screen not found — install with: apt install screen")
+            return False
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to spawn server for room {room_id}: {e}")
+            return False
 
     def kill_server(self, room_id: str):
         self._known_rooms.discard(room_id)
-        result = self._post(f"/kill/{room_id}")
-        if not result.get("ok"):
-            logger.warning(f"Kill server {room_id}: {result.get('error')}")
-        else:
+        sname = _screen_name(room_id)
+        try:
+            subprocess.run(["screen", "-S", sname, "-X", "quit"], check=True)
             logger.info(f"Killed server for room {room_id}")
+        except subprocess.CalledProcessError:
+            logger.info(f"Screen session '{sname}' was already gone")
 
     def is_alive(self, room_id: str) -> bool:
-        result = self._get(f"/alive/{room_id}")
-        return result.get("alive", False)
+        sname = _screen_name(room_id)
+        result = subprocess.run(
+            ["screen", "-ls", sname],
+            capture_output=True, text=True,
+        )
+        return sname in result.stdout
 
     def cleanup_dead(self) -> list[str]:
         """Returns room_ids whose screen sessions have exited."""
