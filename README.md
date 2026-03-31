@@ -4,31 +4,12 @@ FastAPI-based matchmaking and game server orchestration service.
 
 ## Setup
 
-### Local (without Docker)
-
 ```bash
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env   # Edit with your settings
 python main.py         # Starts on http://0.0.0.0:8000
-```
-
-### Docker
-
-```bash
-docker compose up -d --build
-```
-
-Uses `network_mode: host` so the container shares the host's network stack (required for spawning game servers on host ports).
-
-### Host Agent
-
-The host agent must run **on the host machine** (not inside Docker). It spawns game server processes as `screen` sessions:
-
-```bash
-python host_agent.py
-# Listens on 127.0.0.1:8099
 ```
 
 Prerequisites: `screen` (`apt install screen` on Debian/Ubuntu).
@@ -45,7 +26,6 @@ Prerequisites: `screen` (`apt install screen` on Debian/Ubuntu).
 | `SERVER_SECRET` | `change-me-in-production` | Shared secret between master and game servers |
 | `ADMIN_API_KEY` | `change-me` | Key for admin endpoints |
 | `MASTER_SERVER_INTERNAL_URL` | `http://127.0.0.1:8000` | URL game servers use to reach master server |
-| `HOST_AGENT_URL` | `http://127.0.0.1:8099` | URL of host_agent.py |
 | `MAX_ROOMS_PER_MINUTE` | `5` | Rate limit per client IP |
 | `LOG_DIR` | `logs` | Directory for game server log files |
 | `DB_PATH` | `master_server.db` | SQLite database path |

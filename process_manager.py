@@ -42,7 +42,7 @@ class ProcessManager:
             "--master-server-url", config.MASTER_SERVER_INTERNAL_URL,
         ]
 
-        bash_cmd = f"{shlex.join(game_args)} >> {shlex.quote(log_file)} 2>&1"
+        bash_cmd = f"{shlex.join(game_args)} 2>&1 | tee -a {shlex.quote(log_file)}"
         cwd = config.GAME_SERVER_DIR or os.path.dirname(server_path) or None
 
         env = os.environ.copy()
